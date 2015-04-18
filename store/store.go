@@ -78,7 +78,7 @@ type store struct {
 	worldLock      sync.RWMutex // stop the world lock
 	clock          clockwork.Clock
 	readonlySet    types.Set
-	streamsDir string
+	streamsDir     string
 	streamsStore   streamsStore
 }
 
@@ -202,11 +202,43 @@ func (s *store) StreamGet(nodePath string) (*Event, error) {
 // StreamGet is the Get method for stream storage
 func (s *store) StreamTail(nodePath string, listener streams.StreamListener) {
 	s.worldLock.RLock()
-	defer s.worldLock.RUnlock()
+
+	var err error
 
 	nodePath = path.Clean(path.Join("/", nodePath))
 
-	s.streamsStore.StreamTail(nodePath, listener)
+	var stream *streams.AppendStream
+	var pos int64
+	var options streams.TailOptions
+
+	lastSlash := strings.LastIndex(nodePath, "/")
+	if lastSlash == -1 {
+		err = fmt.Errorf("Invalid stream path")
+	} else {
+		streamPath := nodePath[:lastSlash]
+		streamOffset := nodePath[lastSlash+1:]
+
+		pos, err = strconv.ParseInt(streamOffset, 16, 64)
+		if err != nil {
+			err = fmt.Errorf("Invalid offset")
+		}
+
+		if err == nil {
+			stream, err = s.streamsStore.getStream(streamPath)
+		}
+	}
+
+	if err == nil && stream == nil {
+		err = fmt.Errorf("Invalid stream path")
+	}
+
+	if err != nil {
+		listener.End(err)
+	}
+
+	s.worldLock.RUnlock()
+
+	stream.Tail(pos, options, listener)
 }
 
 // Set creates or replace the node at nodePath.

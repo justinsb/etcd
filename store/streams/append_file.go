@@ -6,6 +6,8 @@ import (
 	"hash/crc32"
 	"encoding/binary"
 	"fmt"
+	"sync"
+	"sync/atomic"
 )
 
 var crc32c_table = crc32.MakeTable(crc32.Castagnoli)
@@ -53,9 +55,12 @@ func (s*entryHeader) Init(value []byte) {
 type AppendStream struct {
 	streamKey string
 
-	nextOffset int64
 	fd   *os.File
 	clone      bool
+
+	offsetMutex     sync.Mutex
+	offsetCondition sync.Cond
+	nextOffset      int64
 }
 
 func NewAppendStream(basedir, streamKey string) (*AppendStream, error) {
@@ -70,11 +75,12 @@ func NewAppendStream(basedir, streamKey string) (*AppendStream, error) {
 	s := new(AppendStream)
 	s.streamKey = streamKey
 	s.fd = fd
+	s.offsetCondition.L = &s.offsetMutex
 	return s, nil
 }
 
 func (s *AppendStream) GetTail() (int64) {
-	tail := s.nextOffset
+	tail := atomic.LoadInt64(&s.nextOffset)
 	return tail
 }
 
@@ -91,7 +97,20 @@ func (s *AppendStream) Tail(startPos int64, options TailOptions, listener Stream
 	pos := startPos
 	count := 0
 
-	for pos < s.nextOffset {
+	tail := atomic.LoadInt64(&s.nextOffset)
+
+	for {
+		if pos >= tail {
+			s.offsetMutex.Lock()
+			tail = s.nextOffset
+			for pos >= tail {
+				log.Print("Waiting ", pos, " vs ", tail)
+				s.offsetCondition.Wait()
+				tail = s.nextOffset
+			}
+			s.offsetMutex.Unlock()
+		}
+
 		var header entryHeader
 		err := header.ReadAt(s.fd, pos)
 		if err != nil {
@@ -122,16 +141,12 @@ func (s *AppendStream) Tail(startPos int64, options TailOptions, listener Stream
 		}
 
 		count++
-		pos += int64(header.payloadSize+EntryHeaderLength)
+		pos += int64(header.payloadSize + EntryHeaderLength)
 
 		if options.Count != 0 && count >= options.Count {
 			log.Print("Hit max count: ", options.Count)
 			break
 		}
-	}
-
-	if pos >= s.nextOffset {
-		log.Print("Reached end of file")
 	}
 
 	listener.End(nil)
@@ -163,6 +178,11 @@ func (s *AppendStream) Read(pos int64) ([]byte, error) {
 func (s *AppendStream) Append(value []byte) (int64, error) {
 	var err error
 
+	log.Print("Append prelock ", s.streamKey)
+
+	s.offsetMutex.Lock()
+	defer s.offsetMutex.Unlock()
+
 	pos := s.nextOffset
 
 	log.Print("Append ", s.streamKey, "@", pos)
@@ -180,7 +200,8 @@ func (s *AppendStream) Append(value []byte) (int64, error) {
 		return 0, err
 	}
 
-	s.nextOffset += int64(EntryHeaderLength + len(value))
+	atomic.AddInt64(&s.nextOffset, int64(EntryHeaderLength + len(value)))
+	s.offsetCondition.Broadcast()
 
 	return pos, nil
 }
@@ -198,7 +219,7 @@ func (s *AppendStream) Clone() (*AppendStream) {
 func (s *AppendStream) SaveNoCopy() ([]byte, error) {
 	log.Print("SaveNoCopy of ", s.streamKey)
 
-	n := s.nextOffset
+	n := atomic.LoadInt64(&s.nextOffset)
 
 	value := make([]byte, n)
 
@@ -212,12 +233,18 @@ func (s *AppendStream) SaveNoCopy() ([]byte, error) {
 
 
 func (s *AppendStream) Recovery(state []byte) error {
+	s.offsetMutex.Lock()
+	defer s.offsetMutex.Unlock()
+
 	log.Print("Recovery of ", s.streamKey)
 
 	n, err := s.fd.WriteAt(state, 0)
 	if err != nil {
 		return err
 	}
-	s.nextOffset = int64(n)
+
+	atomic.StoreInt64(&s.nextOffset, int64(n))
+	s.offsetCondition.Broadcast()
+
 	return nil
 }
