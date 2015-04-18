@@ -110,6 +110,8 @@ func (c *ServerConfig) WALDir() string { return path.Join(c.MemberDir(), "wal") 
 
 func (c *ServerConfig) SnapDir() string { return path.Join(c.MemberDir(), "snap") }
 
+func (c *ServerConfig) StreamsDir() string { return path.Join(c.MemberDir(), "streams") }
+
 func (c *ServerConfig) ShouldDiscover() bool { return c.DiscoveryURL != "" }
 
 func (c *ServerConfig) PrintWithInitial() { c.print(true) }

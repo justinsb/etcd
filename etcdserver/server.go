@@ -56,8 +56,13 @@ const (
 	// TODO: calculate based on heartbeat interval
 	defaultPublishRetryInterval = 5 * time.Second
 
-	StoreAdminPrefix = "/0"
-	StoreKeysPrefix  = "/1"
+	StoreAdminId   = 0
+	StoreKeysId    = 1
+	StoreStreamsId = 2
+
+	StoreAdminPrefix   = "/0"
+	StoreKeysPrefix    = "/1"
+	StoreStreamsPrefix = "/2"
 
 	purgeFileInterval = 30 * time.Second
 )
@@ -150,7 +155,7 @@ type EtcdServer struct {
 // NewServer creates a new EtcdServer from the supplied configuration. The
 // configuration is considered static for the lifetime of the EtcdServer.
 func NewServer(cfg *ServerConfig) (*EtcdServer, error) {
-	st := store.New(StoreAdminPrefix, StoreKeysPrefix)
+	st := store.New(cfg.StreamsDir(), StoreAdminPrefix, StoreKeysPrefix)
 	var w *wal.WAL
 	var n raft.Node
 	var s *raft.MemoryStorage
@@ -693,6 +698,22 @@ func (s *EtcdServer) applyRequest(r pb.Request) Response {
 	f := func(ev *store.Event, err error) Response {
 		return Response{Event: ev, err: err}
 	}
+
+	if r.StoreId == StoreStreamsId {
+		switch r.Method {
+		case "POST":
+			return f(s.store.StreamAppend(r.Path, []byte(r.Val)))
+		case "QGET":
+			return f(s.store.StreamGet(r.Path))
+		case "SYNC":
+			s.store.DeleteExpiredKeys(time.Unix(0, r.Time))
+			return Response{}
+		default:
+			// This should never be reached, but just in case:
+			return Response{err: ErrUnknownMethod}
+		}
+	}
+
 	expr := timeutil.UnixNanoToTime(r.Expiration)
 	switch r.Method {
 	case "POST":

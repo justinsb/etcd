@@ -204,6 +204,9 @@ func startNode(cfg *ServerConfig, ids []types.ID) (id types.ID, n raft.Node, s *
 	if err := os.MkdirAll(cfg.SnapDir(), privateDirMode); err != nil {
 		log.Fatalf("etcdserver create snapshot directory error: %v", err)
 	}
+	if err := os.MkdirAll(cfg.StreamsDir(), privateDirMode); err != nil {
+		log.Fatalf("etcdserver create streams directory error: %v", err)
+	}
 	if w, err = wal.Create(cfg.WALDir(), metadata); err != nil {
 		log.Fatalf("etcdserver: create wal error: %v", err)
 	}

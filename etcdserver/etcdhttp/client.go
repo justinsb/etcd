@@ -46,6 +46,7 @@ import (
 const (
 	securityPrefix           = "/v2/security"
 	keysPrefix               = "/v2/keys"
+	streamsPrefix            = "/v2/streams"
 	deprecatedMachinesPrefix = "/v2/machines"
 	membersPrefix            = "/v2/members"
 	statsPrefix              = "/v2/stats"
@@ -60,6 +61,14 @@ func NewClientHandler(server *etcdserver.EtcdServer) http.Handler {
 	sec := security.NewStore(server, defaultServerTimeout)
 
 	kh := &keysHandler{
+		sec:         sec,
+		server:      server,
+		clusterInfo: server.Cluster,
+		timer:       server,
+		timeout:     defaultServerTimeout,
+	}
+
+	streamsHandler := &streamsHandler {
 		sec:         sec,
 		server:      server,
 		clusterInfo: server.Cluster,
@@ -93,6 +102,8 @@ func NewClientHandler(server *etcdserver.EtcdServer) http.Handler {
 	mux.HandleFunc(versionPath, serveVersion)
 	mux.Handle(keysPrefix, kh)
 	mux.Handle(keysPrefix+"/", kh)
+	mux.Handle(streamsPrefix, streamsHandler)
+	mux.Handle(streamsPrefix+"/", streamsHandler)
 	mux.HandleFunc(statsPrefix+"/store", sh.serveStore)
 	mux.HandleFunc(statsPrefix+"/self", sh.serveSelf)
 	mux.HandleFunc(statsPrefix+"/leader", sh.serveLeader)
@@ -150,6 +161,57 @@ func (h *keysHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(context.Background(), defaultWatchTimeout)
 		defer cancel()
 		handleKeyWatch(ctx, w, resp.Watcher, rr.Stream, h.timer)
+	default:
+		writeError(w, errors.New("received response with no Event/Watcher!"))
+	}
+}
+
+type streamsHandler struct {
+	sec         *security.Store
+	server      etcdserver.Server
+	clusterInfo etcdserver.ClusterInfo
+	timer       etcdserver.RaftTimer
+	timeout     time.Duration
+}
+
+func (h *streamsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !allowMethod(w, r.Method, "HEAD", "GET", "PUT", "POST", "DELETE") {
+		return
+	}
+
+	w.Header().Set("X-Etcd-Cluster-ID", h.clusterInfo.ID().String())
+
+	ctx, cancel := context.WithTimeout(context.Background(), h.timeout)
+	defer cancel()
+
+	rr, err := parseStreamsRequest(r, clockwork.NewRealClock())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	// The path must be valid at this point (we've parsed the request successfully).
+	if !hasKeyPrefixAccess(h.sec, r, r.URL.Path[len(streamsPrefix):]) {
+		writeNoAuth(w)
+		return
+	}
+
+	resp, err := h.server.Do(ctx, rr)
+	if err != nil {
+		err = trimErrorPrefix(err, etcdserver.StoreStreamsPrefix)
+		writeError(w, err)
+		return
+	}
+
+	switch {
+	case resp.Event != nil:
+		if err := writeStreamsEvent(w, resp.Event, h.timer); err != nil {
+			// Should never be reached
+			log.Printf("error writing event: %v", err)
+		}
+//	case resp.Watcher != nil:
+//		ctx, cancel := context.WithTimeout(context.Background(), defaultWatchTimeout)
+//		defer cancel()
+//		handleStreamsWatch(ctx, w, resp.Watcher, rr.Stream, h.timer)
 	default:
 		writeError(w, errors.New("received response with no Event/Watcher!"))
 	}
@@ -492,6 +554,7 @@ func parseKeyRequest(r *http.Request, clock clockwork.Clock) (etcdserverpb.Reque
 		Sorted:    sort,
 		Quorum:    quorum,
 		Stream:    stream,
+		StoreId:   etcdserver.StoreKeysId,
 	}
 
 	if pe != nil {
@@ -502,6 +565,62 @@ func parseKeyRequest(r *http.Request, clock clockwork.Clock) (etcdserverpb.Reque
 	if ttl != nil {
 		expr := time.Duration(*ttl) * time.Second
 		rr.Expiration = clock.Now().Add(expr).UnixNano()
+	}
+
+	return rr, nil
+}
+
+
+// parseStreamsRequest converts a received http.Request on keysPrefix to
+// a server Request, performing validation of supplied fields as appropriate.
+// If any validation fails, an empty Request and non-nil error is returned.
+func parseStreamsRequest(r *http.Request, clock clockwork.Clock) (etcdserverpb.Request, error) {
+	emptyReq := etcdserverpb.Request{}
+
+	params, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return emptyReq, etcdErr.NewRequestError(
+			etcdErr.EcodeInvalidForm,
+			err.Error(),
+		)
+	}
+
+	if !strings.HasPrefix(r.URL.Path, streamsPrefix) {
+		return emptyReq, etcdErr.NewRequestError(
+			etcdErr.EcodeInvalidForm,
+			"incorrect key prefix",
+		)
+	}
+	p := path.Join(etcdserver.StoreStreamsPrefix, r.URL.Path[len(streamsPrefix):])
+
+	quorum := params.Get("quorum") == "1"
+
+	var value []byte
+
+	if r.Method == "POST" {
+		if r.Body != nil {
+			value, err = ioutil.ReadAll(r.Body)
+			if err != nil {
+				return emptyReq, etcdErr.NewRequestError(
+					etcdErr.EcodeInvalidField,
+					"error reading request body",
+				)
+			}
+		}
+		if value == nil {
+			return emptyReq, etcdErr.NewRequestError(
+				etcdErr.EcodeInvalidField,
+				"request body is required with POST method",
+			)
+		}
+	}
+
+	rr := etcdserverpb.Request{
+		Method:    r.Method,
+		Path:      p,
+		Val:       string(value),
+		Quorum:    quorum,
+		StoreId:   etcdserver.StoreStreamsId,
 	}
 
 	return rr, nil
@@ -524,6 +643,26 @@ func writeKeyEvent(w http.ResponseWriter, ev *store.Event, rt etcdserver.RaftTim
 	}
 
 	ev = trimEventPrefix(ev, etcdserver.StoreKeysPrefix)
+	return json.NewEncoder(w).Encode(ev)
+}
+
+// writeStreamsEvent trims the prefix of key path in a single Event under
+// StoreStreamsPrefix, serializes it and writes the resulting JSON to the given
+// ResponseWriter, along with the appropriate headers.
+func writeStreamsEvent(w http.ResponseWriter, ev *store.Event, rt etcdserver.RaftTimer) error {
+	if ev == nil {
+		return errors.New("cannot write empty Event!")
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Etcd-Index", fmt.Sprint(ev.EtcdIndex))
+	w.Header().Set("X-Raft-Index", fmt.Sprint(rt.Index()))
+	w.Header().Set("X-Raft-Term", fmt.Sprint(rt.Term()))
+
+	if ev.IsCreated() {
+		w.WriteHeader(http.StatusCreated)
+	}
+
+	ev = trimEventPrefix(ev, etcdserver.StoreStreamsPrefix)
 	return json.NewEncoder(w).Encode(ev)
 }
 

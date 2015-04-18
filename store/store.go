@@ -53,6 +53,9 @@ type Store interface {
 
 	Watch(prefix string, recursive, stream bool, sinceIndex uint64) (Watcher, error)
 
+	StreamAppend(nodePath string, value []byte) (*Event, error)
+	StreamGet(nodePath string) (*Event, error)
+
 	Save() ([]byte, error)
 	Recovery(state []byte) error
 
@@ -73,17 +76,21 @@ type store struct {
 	worldLock      sync.RWMutex // stop the world lock
 	clock          clockwork.Clock
 	readonlySet    types.Set
+	streamsDir string
+	streamsStore   streamsStore
 }
 
 // The given namespaces will be created as initial directories in the returned store.
-func New(namespaces ...string) Store {
-	s := newStore(namespaces...)
+func New(streamsDir string, namespaces ...string) Store {
+	s := newStore(streamsDir, namespaces...)
 	s.clock = clockwork.NewRealClock()
 	return s
 }
 
-func newStore(namespaces ...string) *store {
+func newStore(streamsDir string, namespaces ...string) *store {
 	s := new(store)
+	s.streamsDir = streamsDir
+	s.streamsStore.init(streamsDir)
 	s.CurrentVersion = defaultVersion
 	s.Root = newDir(s, "/", s.CurrentIndex, nil, Permanent)
 	for _, namespace := range namespaces {
@@ -150,6 +157,44 @@ func (s *store) Create(nodePath string, dir bool, value string, unique bool, exp
 	}
 
 	return e, err
+}
+
+// StreamAppend is similar to Create, but only supports appending to a stream.
+// It will create the stream if it does not already exist.
+func (s *store) StreamAppend(nodePath string, value []byte) (*Event, error) {
+	s.worldLock.Lock()
+	defer s.worldLock.Unlock()
+
+	e, err := s.streamsStore.StreamAppend(nodePath, value)
+
+	if err == nil {
+		e.EtcdIndex = s.CurrentIndex
+		s.WatcherHub.notify(e)
+		s.Stats.Inc(CreateSuccess)
+	} else {
+		s.Stats.Inc(CreateFail)
+	}
+
+	return e, err
+}
+
+// StreamGet is the Get method for stream storage
+func (s *store) StreamGet(nodePath string) (*Event, error) {
+	s.worldLock.RLock()
+	defer s.worldLock.RUnlock()
+
+	nodePath = path.Clean(path.Join("/", nodePath))
+
+	e, err := s.streamsStore.StreamGet(nodePath)
+
+	if err != nil {
+		s.Stats.Inc(GetFail)
+		return nil, err
+	}
+
+	s.Stats.Inc(GetSuccess)
+
+	return e, nil
 }
 
 // Set creates or replace the node at nodePath.
@@ -646,7 +691,7 @@ func (s *store) SaveNoCopy() ([]byte, error) {
 func (s *store) Clone() Store {
 	s.worldLock.Lock()
 
-	clonedStore := newStore()
+	clonedStore := newStore(s.streamsDir)
 	clonedStore.CurrentIndex = s.CurrentIndex
 	clonedStore.Root = s.Root.Clone()
 	clonedStore.WatcherHub = s.WatcherHub.clone()
