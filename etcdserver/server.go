@@ -43,6 +43,7 @@ import (
 	"github.com/coreos/etcd/rafthttp"
 	"github.com/coreos/etcd/snap"
 	"github.com/coreos/etcd/store"
+	"github.com/coreos/etcd/store/streams"
 	"github.com/coreos/etcd/version"
 	"github.com/coreos/etcd/wal"
 )
@@ -109,6 +110,8 @@ type Server interface {
 	Leader() types.ID
 	// Do takes a request and attempts to fulfill it, returning a Response.
 	Do(ctx context.Context, r pb.Request) (Response, error)
+	// Do takes a request and attempts to fulfill it, streaming responses
+	DoStream(r pb.Request, listener streams.StreamListener)
 	// Process takes a raft message and applies it to the server's raft state
 	// machine, respecting any timeout of the given context.
 	Process(ctx context.Context, m raftpb.Message) error
@@ -513,6 +516,18 @@ func (s *EtcdServer) Do(ctx context.Context, r pb.Request) (Response, error) {
 	default:
 		return Response{}, ErrUnknownMethod
 	}
+}
+
+
+func (s *EtcdServer) DoStream(r pb.Request, listener streams.StreamListener) {
+	if r.StoreId == StoreStreamsId {
+		if r.Method == "TAIL" {
+			s.store.StreamTail(r.Path, listener)
+			return
+		}
+	}
+
+	listener.End(ErrUnknownMethod)
 }
 
 func (s *EtcdServer) SelfStats() []byte { return s.stats.JSON() }

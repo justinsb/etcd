@@ -28,6 +28,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/net/websocket"
+
 	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/jonboulle/clockwork"
 	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/prometheus/client_golang/prometheus"
 	"github.com/coreos/etcd/Godeps/_workspace/src/golang.org/x/net/context"
@@ -47,6 +49,7 @@ const (
 	securityPrefix           = "/v2/security"
 	keysPrefix               = "/v2/keys"
 	streamsPrefix            = "/v2/streams"
+	wsStreamsPrefix          = "/v2/ws/streams"
 	deprecatedMachinesPrefix = "/v2/machines"
 	membersPrefix            = "/v2/members"
 	statsPrefix              = "/v2/stats"
@@ -76,6 +79,11 @@ func NewClientHandler(server *etcdserver.EtcdServer) http.Handler {
 		timeout:     defaultServerTimeout,
 	}
 
+	websocketStreamsHandler := &websocketStreamsHandler {
+		streamsHandler: streamsHandler,
+	}
+	websocketStreamsHandler.init()
+
 	sh := &statsHandler{
 		stats: server,
 	}
@@ -103,6 +111,7 @@ func NewClientHandler(server *etcdserver.EtcdServer) http.Handler {
 	mux.Handle(keysPrefix, kh)
 	mux.Handle(keysPrefix+"/", kh)
 	mux.Handle(streamsPrefix, streamsHandler)
+	mux.Handle(wsStreamsPrefix + "/", websocketStreamsHandler.server)
 	mux.Handle(streamsPrefix+"/", streamsHandler)
 	mux.HandleFunc(statsPrefix+"/store", sh.serveStore)
 	mux.HandleFunc(statsPrefix+"/self", sh.serveSelf)
@@ -172,6 +181,65 @@ type streamsHandler struct {
 	clusterInfo etcdserver.ClusterInfo
 	timer       etcdserver.RaftTimer
 	timeout     time.Duration
+}
+
+type websocketStreamsHandler struct {
+	server websocket.Server
+	streamsHandler *streamsHandler
+}
+
+func (h *websocketStreamsHandler) init() {
+	h.server.Handler  = func (ws *websocket.Conn) {
+		session := &websocketStreamsSession{}
+		session.ws = ws
+		session.streamsHandler = h.streamsHandler
+		session.ServeWebsocket()
+	}
+}
+
+type websocketStreamsSession struct {
+	ws *websocket.Conn
+	streamsHandler *streamsHandler
+}
+
+func (h *websocketStreamsSession) End(err error) {
+	if err != nil {
+		log.Print("Error reading log stream: ", err)
+		h.ws.Close()
+	}
+}
+
+func (h *websocketStreamsSession) GotValue(pos int64, value []byte) error {
+	err := websocket.Message.Send(h.ws, value)
+	if err != nil {
+		log.Print("Error sending message on websocket: ", err)
+		return err
+	}
+	return nil
+}
+
+func (s *websocketStreamsSession) ServeWebsocket() {
+	u := s.ws.Config().Location
+
+	// TODO: Security?
+
+	path := u.Path
+
+	if !strings.HasPrefix(path, wsStreamsPrefix) {
+		log.Print("Invalid prefix ", path)
+		s.ws.Close()
+		return
+	}
+
+	suffix := path[len(wsStreamsPrefix):]
+	rr := etcdserverpb.Request{
+		Method:    "TAIL",
+		Path:      etcdserver.StoreStreamsPrefix + suffix,
+		StoreId:   etcdserver.StoreStreamsId,
+	}
+
+	log.Print("RR", rr);
+	s.streamsHandler.server.DoStream(rr, s)
 }
 
 func (h *streamsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {

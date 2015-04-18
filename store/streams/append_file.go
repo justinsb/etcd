@@ -78,6 +78,65 @@ func (s *AppendStream) GetTail() (int64) {
 	return tail
 }
 
+type TailOptions struct {
+	Count int
+}
+
+type StreamListener interface {
+	GotValue(pos int64, value []byte) error
+	End(err error)
+}
+
+func (s *AppendStream) Tail(startPos int64, options TailOptions, listener StreamListener) {
+	pos := startPos
+	count := 0
+
+	for pos < s.nextOffset {
+		var header entryHeader
+		err := header.ReadAt(s.fd, pos)
+		if err != nil {
+			listener.End(fmt.Errorf("Not a valid offset"))
+			return
+		}
+
+		// TODO: Sanity check length
+		value := make([]byte, header.payloadSize)
+		_, err = s.fd.ReadAt(value, pos+EntryHeaderLength)
+		if err != nil {
+			listener.End(fmt.Errorf("Not a valid offset"))
+			return
+		}
+
+		actualCrc := crc32.Checksum(value, crc32c_table)
+		if header.checksum != actualCrc {
+			listener.End(fmt.Errorf("Not a valid offset"))
+			return
+		}
+
+		log.Print("Sending value @", pos)
+
+		err = listener.GotValue(pos, value)
+		if err != nil {
+			log.Print("GotValue returned error; stopping");
+			break
+		}
+
+		count++
+		pos += int64(header.payloadSize+EntryHeaderLength)
+
+		if options.Count != 0 && count >= options.Count {
+			log.Print("Hit max count: ", options.Count)
+			break
+		}
+	}
+
+	if pos >= s.nextOffset {
+		log.Print("Reached end of file")
+	}
+
+	listener.End(nil)
+}
+
 func (s *AppendStream) Read(pos int64) ([]byte, error) {
 	var header entryHeader
 	err := header.ReadAt(s.fd, pos)

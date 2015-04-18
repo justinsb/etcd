@@ -109,6 +109,34 @@ func (s *streamsStore) StreamGet(nodePath string) (*Event, error) {
 }
 
 
+func (s *streamsStore) StreamTail(nodePath string, listener streams.StreamListener) {
+	log.Print("StreamTail ", nodePath)
+
+	lastSlash := strings.LastIndex(nodePath, "/")
+	if lastSlash == -1 {
+		listener.End(fmt.Errorf("Invalid nodePath"))
+		return
+	}
+	streamPath := nodePath[:lastSlash]
+	streamOffset := nodePath[lastSlash+1:]
+
+	stream, err := s.getStream(streamPath)
+	if err != nil {
+		listener.End(err)
+		return
+	}
+
+	pos, err := strconv.ParseInt(streamOffset, 16, 64)
+	if err != nil {
+		listener.End(fmt.Errorf("Invalid offset"))
+		return
+	}
+
+	var options streams.TailOptions
+	stream.Tail(pos, options, listener)
+}
+
+
 func (s *streamsStore) getStream(key string) (*streams.AppendStream, error) {
 	log.Print("getStream", key)
 	s.mutex.Lock()

@@ -26,6 +26,7 @@ import (
 	"github.com/coreos/etcd/Godeps/_workspace/src/github.com/jonboulle/clockwork"
 	etcdErr "github.com/coreos/etcd/error"
 	"github.com/coreos/etcd/pkg/types"
+	"github.com/coreos/etcd/store/streams"
 )
 
 // The default version to set when the store is first initialized.
@@ -55,6 +56,7 @@ type Store interface {
 
 	StreamAppend(nodePath string, value []byte) (*Event, error)
 	StreamGet(nodePath string) (*Event, error)
+	StreamTail(nodePath string, listener streams.StreamListener)
 
 	Save() ([]byte, error)
 	Recovery(state []byte) error
@@ -195,6 +197,16 @@ func (s *store) StreamGet(nodePath string) (*Event, error) {
 	s.Stats.Inc(GetSuccess)
 
 	return e, nil
+}
+
+// StreamGet is the Get method for stream storage
+func (s *store) StreamTail(nodePath string, listener streams.StreamListener) {
+	s.worldLock.RLock()
+	defer s.worldLock.RUnlock()
+
+	nodePath = path.Clean(path.Join("/", nodePath))
+
+	s.streamsStore.StreamTail(nodePath, listener)
 }
 
 // Set creates or replace the node at nodePath.
